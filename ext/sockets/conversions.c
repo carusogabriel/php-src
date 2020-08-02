@@ -488,13 +488,7 @@ void to_zval_read_int(const char *data, zval *zv, res_context *ctx)
 
 	ZVAL_LONG(zv, (zend_long)ival);
 }
-static void to_zval_read_unsigned(const char *data, zval *zv, res_context *ctx)
-{
-	unsigned ival;
-	memcpy(&ival, data, sizeof(ival));
 
-	ZVAL_LONG(zv, (zend_long)ival);
-}
 static void to_zval_read_net_uint16(const char *data, zval *zv, res_context *ctx)
 {
 	uint16_t ival;
@@ -502,13 +496,7 @@ static void to_zval_read_net_uint16(const char *data, zval *zv, res_context *ctx
 
 	ZVAL_LONG(zv, (zend_long)ntohs(ival));
 }
-static void to_zval_read_uint32(const char *data, zval *zv, res_context *ctx)
-{
-	uint32_t ival;
-	memcpy(&ival, data, sizeof(ival));
 
-	ZVAL_LONG(zv, (zend_long)ival);
-}
 static void to_zval_read_sa_family(const char *data, zval *zv, res_context *ctx)
 {
 	sa_family_t ival;
@@ -583,6 +571,7 @@ static void to_zval_read_sockaddr_in(const char *data, zval *zv, res_context *ct
 {
 	to_zval_read_aggregation(data, zv, descriptors_sockaddr_in, ctx);
 }
+
 #if HAVE_IPV6
 static void from_zval_write_sin6_addr(const zval *zaddr_str, char *addr6, ser_context *ctx)
 {
@@ -628,15 +617,110 @@ static const field_descriptor descriptors_sockaddr_in6[] = {
 		{"scope_id", sizeof("scope_id"), 0, offsetof(struct sockaddr_in6, sin6_scope_id), from_zval_write_uint32, to_zval_read_uint32},
 		{0}
 };
+
 static void from_zval_write_sockaddr_in6(const zval *container, char *sockaddr6, ser_context *ctx)
 {
 	from_zval_write_aggregation(container, sockaddr6, descriptors_sockaddr_in6, ctx);
 }
+
 static void to_zval_read_sockaddr_in6(const char *data, zval *zv, res_context *ctx)
 {
 	to_zval_read_aggregation(data, zv, descriptors_sockaddr_in6, ctx);
 }
+
+static void to_zval_read_uint32(const char *data, zval *zv, res_context *ctx)
+{
+	uint32_t ival;
+	memcpy(&ival, data, sizeof(ival));
+
+	ZVAL_LONG(zv, (zend_long)ival);
+}
+
+/* CONVERSIONS for struct in6_pktinfo */
+#if defined(IPV6_PKTINFO)
+static const field_descriptor descriptors_in6_pktinfo[] = {
+		{"addr", sizeof("addr"), 1, offsetof(struct in6_pktinfo, ipi6_addr), from_zval_write_sin6_addr, to_zval_read_sin6_addr},
+		{"ifindex", sizeof("ifindex"), 1, offsetof(struct in6_pktinfo, ipi6_ifindex), from_zval_write_ifindex, to_zval_read_unsigned},
+		{0}
+};
+
+void from_zval_write_in6_pktinfo(const zval *container, char *in6_pktinfo_c, ser_context *ctx)
+{
+	from_zval_write_aggregation(container, in6_pktinfo_c, descriptors_in6_pktinfo, ctx);
+}
+
+void to_zval_read_in6_pktinfo(const char *data, zval *zv, res_context *ctx)
+{
+	array_init_size(zv, 2);
+
+	to_zval_read_aggregation(data, zv, descriptors_in6_pktinfo, ctx);
+}
+
+static void to_zval_read_unsigned(const char *data, zval *zv, res_context *ctx)
+{
+	unsigned ival;
+	memcpy(&ival, data, sizeof(ival));
+
+	ZVAL_LONG(zv, (zend_long)ival);
+}
+
+/* CONVERSIONS for if_index */
+static void from_zval_write_ifindex(const zval *zv, char *uinteger, ser_context *ctx)
+{
+	unsigned ret = 0;
+
+	if (Z_TYPE_P(zv) == IS_LONG) {
+		if (Z_LVAL_P(zv) < 0 || (zend_ulong)Z_LVAL_P(zv) > UINT_MAX) { /* allow 0 (unspecified interface) */
+			do_from_zval_err(ctx, "the interface index cannot be negative or "
+					"larger than %u; given " ZEND_LONG_FMT, UINT_MAX, Z_LVAL_P(zv));
+		} else {
+			ret = (unsigned)Z_LVAL_P(zv);
+		}
+	} else {
+		zend_string *str, *tmp_str;
+
+		str = zval_get_tmp_string((zval *) zv, &tmp_str);
+
+#if HAVE_IF_NAMETOINDEX
+		ret = if_nametoindex(ZSTR_VAL(str));
+		if (ret == 0) {
+			do_from_zval_err(ctx, "no interface with name \"%s\" could be found", ZSTR_VAL(str));
+		}
+#elif defined(SIOCGIFINDEX)
+		{
+			struct ifreq ifr;
+			if (strlcpy(ifr.ifr_name, ZSTR_VAL(str), sizeof(ifr.ifr_name))
+					>= sizeof(ifr.ifr_name)) {
+				do_from_zval_err(ctx, "the interface name \"%s\" is too large ", ZSTR_VAL(str));
+			} else if (ioctl(ctx->sock->bsd_socket, SIOCGIFINDEX, &ifr) < 0) {
+				if (errno == ENODEV) {
+					do_from_zval_err(ctx, "no interface with name \"%s\" could be "
+							"found", ZSTR_VAL(str));
+				} else {
+					do_from_zval_err(ctx, "error fetching interface index for "
+							"interface with name \"%s\" (errno %d)",
+							ZSTR_VAL(str), errno);
+				}
+			} else {
+				ret = (unsigned)ifr.ifr_ifindex;
+			}
+		}
+#else
+		do_from_zval_err(ctx,
+				"this platform does not support looking up an interface by "
+				"name, an integer interface index must be supplied instead");
+#endif
+
+		zend_tmp_string_release(tmp_str);
+	}
+
+	if (!ctx->err.has_error) {
+		memcpy(uinteger, &ret, sizeof(ret));
+	}
+}
+#endif
 #endif /* HAVE_IPV6 */
+
 static void from_zval_write_sun_path(const zval *path, char *sockaddr_un_c, ser_context *ctx)
 {
 	zend_string			*path_str, *tmp_path_str;
@@ -1220,80 +1304,6 @@ void to_zval_read_msghdr(const char *msghdr_c, zval *zv, res_context *ctx)
 
 	to_zval_read_aggregation(msghdr_c, zv, descriptors, ctx);
 }
-
-/* CONVERSIONS for if_index */
-static void from_zval_write_ifindex(const zval *zv, char *uinteger, ser_context *ctx)
-{
-	unsigned ret = 0;
-
-	if (Z_TYPE_P(zv) == IS_LONG) {
-		if (Z_LVAL_P(zv) < 0 || (zend_ulong)Z_LVAL_P(zv) > UINT_MAX) { /* allow 0 (unspecified interface) */
-			do_from_zval_err(ctx, "the interface index cannot be negative or "
-					"larger than %u; given " ZEND_LONG_FMT, UINT_MAX, Z_LVAL_P(zv));
-		} else {
-			ret = (unsigned)Z_LVAL_P(zv);
-		}
-	} else {
-		zend_string *str, *tmp_str;
-
-		str = zval_get_tmp_string((zval *) zv, &tmp_str);
-
-#if HAVE_IF_NAMETOINDEX
-		ret = if_nametoindex(ZSTR_VAL(str));
-		if (ret == 0) {
-			do_from_zval_err(ctx, "no interface with name \"%s\" could be found", ZSTR_VAL(str));
-		}
-#elif defined(SIOCGIFINDEX)
-		{
-			struct ifreq ifr;
-			if (strlcpy(ifr.ifr_name, ZSTR_VAL(str), sizeof(ifr.ifr_name))
-					>= sizeof(ifr.ifr_name)) {
-				do_from_zval_err(ctx, "the interface name \"%s\" is too large ", ZSTR_VAL(str));
-			} else if (ioctl(ctx->sock->bsd_socket, SIOCGIFINDEX, &ifr) < 0) {
-				if (errno == ENODEV) {
-					do_from_zval_err(ctx, "no interface with name \"%s\" could be "
-							"found", ZSTR_VAL(str));
-				} else {
-					do_from_zval_err(ctx, "error fetching interface index for "
-							"interface with name \"%s\" (errno %d)",
-							ZSTR_VAL(str), errno);
-				}
-			} else {
-				ret = (unsigned)ifr.ifr_ifindex;
-			}
-		}
-#else
-		do_from_zval_err(ctx,
-				"this platform does not support looking up an interface by "
-				"name, an integer interface index must be supplied instead");
-#endif
-
-		zend_tmp_string_release(tmp_str);
-	}
-
-	if (!ctx->err.has_error) {
-		memcpy(uinteger, &ret, sizeof(ret));
-	}
-}
-
-/* CONVERSIONS for struct in6_pktinfo */
-#if defined(IPV6_PKTINFO) && HAVE_IPV6
-static const field_descriptor descriptors_in6_pktinfo[] = {
-		{"addr", sizeof("addr"), 1, offsetof(struct in6_pktinfo, ipi6_addr), from_zval_write_sin6_addr, to_zval_read_sin6_addr},
-		{"ifindex", sizeof("ifindex"), 1, offsetof(struct in6_pktinfo, ipi6_ifindex), from_zval_write_ifindex, to_zval_read_unsigned},
-		{0}
-};
-void from_zval_write_in6_pktinfo(const zval *container, char *in6_pktinfo_c, ser_context *ctx)
-{
-	from_zval_write_aggregation(container, in6_pktinfo_c, descriptors_in6_pktinfo, ctx);
-}
-void to_zval_read_in6_pktinfo(const char *data, zval *zv, res_context *ctx)
-{
-	array_init_size(zv, 2);
-
-	to_zval_read_aggregation(data, zv, descriptors_in6_pktinfo, ctx);
-}
-#endif
 
 /* CONVERSIONS for struct ucred */
 #ifdef SO_PASSCRED
